@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+
+# ** Network filesystem mounter **
+
+# Dependencies
+#	bash >= 4.x.x
+#	GNU coreutils
+#	mount, cifs driver (Linux Kernel >= 2.x.x)
+#	nbtscan
+
+# **	MIT LICENSE START	**
+#
+# Copyright (c) 2021 Kriss Wiggins
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the “Software”), to deal in the
+# Software without restriction, including without limitation the rights to use, copy,
+# modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the
+# following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+# OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+# AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH
+# THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+# **	MIT LICENSE END		**
+
+#################
+#  Globals		#
+#################
+
+EXEC="$(basename "$0")"
+VERSION=1.0.0
+NBTSCAN=$(which nbtscan)
+
+[ -z "${SUDO-}" ]		&& SUDO=sudo
+[ -n "${SUDO_USER-}" ]	&& USER=$SUDO_USER
+[ -n "${SUDO_UID-}" ]	&& UID=$SUDO_UID
+[ -n "${SUDO_GID-}" ]	&& GID=$SUDO_GID
+
+#################
+#  Tools		#
+#################
+
+run_usr() {
+	# $1: command, $2: args, $3: use sudo (optional bool)
+	local COM="$1"
+	local ARGS="$2"
+	local USE_SUDO=$3
+	if [ -n "${USE_SUDO-}" ] && [ $USE_SUDO ]; then
+		COM="$SUDO $COM"
+	fi
+
+	"$COM" "$ARGS"
+	return $?
+}
+
+get_filesystems() {
+	# $1: output variable
+
+	# Set mutable reference to output arg
+	local -n ref=$1
+
+	# Set kernel and release paths to check:
+	#	FS_PROC and FS_MOD (/proc/... and /lib/modules/... resp.)
+	local FS_PROC=/proc/filesystems
+	local RELEASE=$(uname -r)
+	local FS_MOD=/lib/modules/$RELEASE/kernel/fs
+
+	# Check paths exist and continue accordingly
+	if [ -f $FS_PROC ]; then
+		if [ -d $FS_MOD ]; then
+			K_LIST=$(cat $FS_PROC)
+			# Filter pipe to print last column
+			K_FILTER="awk '{print $NF}'"
+			
+			M_LIST=$(ls -1 $FS_MOD)
+			# Filter pipe to sort alphabedically
+			M_FILTER="sort -u"
+
+			# Merge each list piped through the respective filters
+			local filesystems="$('$K_LIST' | '$K_FILTER'; \
+									'$M_LIST' | '$M_FILTER')"
+
+			# Set the output
+			ref="$filesystems"
+		else
+			echo "Could not find kernel module directory for filesystem driver checks. \
+					Continuing..." >&2
+		fi
+	else
+		echo "Kernel filesystem driver list at $FS_PROC does not exist." >&2
+		return 1
+	fi
+}
+
+check_cifs() {
+	get_filesystems | grep 'cifs' || return 1
+}
+
+netbios_get_addr() {
+	# $1: hostname, $2: subnet, $3: output, $4: use sudo (bool)
+	local -n ref="$3"
+	local ARGS="-r 192.168.$SUBNET.0/24 -s ' '"
+	local FILTER="grep -E '.* $HOSTNAME' | cut -d ' ' -f1"
+	local USE_SUDO=$4
+
+	ref=$(run_usr "$NBTSCAN" "$ARGS" $USE_SUDO | $FILTER)
+}
+
+mount_cifs() {
+	# $1: address, $2: username, $3: password,
+	# $4: fmask, $5: dmask $6: use sudo (bool)
+	local ADDR="$1"
+	local UNAME="$2"
+	local PASS="$3"
+	local FMASK="$4"
+	local DMASK="$5"
+	local USE_SUDO="$6"
+	local MNTPOINT=$(get_mntpoint)
+	local VERS=1.0
+	local ARGS="-t cifs \
+				-o username='$UNAME',password='$PASS', \
+					vers=$VERS, \
+					uid=$UID,gid=$GID, \
+					file_mode=$FMASK,dir_mode=$DMASK \
+				$ADDR \
+				$MNTPOINT"
+	
+	run_user mount "$ARGS" $USE_SUDO
+	run_user rm "-r "$MNTPOINT"" $USE_SUDO
+	return $?
+}
+
+#################
+#  Functions	#
+#################
+
+usage() {
+	expand --tabs=4 <<-EOF
+	usage: $EXEC [options]
+	options:
+	  -h, --help			show usage and options
+	  -v, --version			show version details
+	EOF
+}
+
+version() {
+	cat <<-EOF
+	netmnt $VERSION
+	Network filesystem mounter shell script for GNU/Linux
+	
+	Copyright (c) 2021 Kriss Wiggins
+	MIT License <https://mit-license.org/>
+	This is free software: you are free to change and redistribute it.
+	There is no warranty to the extent permitted by law.
+	EOF
+}
+
+#################
+#  Parser		#
+#################
+
+bad_exit() {
+	# $1: msg, $2: code
+	echo $1 >&2
+	echo
+	usage
+	exit $(($2))
+}
+
+invalid_invocation() {
+	# $1: long (optional bool)
+	local msg
+	if [ -n "${1-}" ] && [ $1 ]; then
+		msg="Invalid option \`--$OPTARG'"
+	else
+		msg="Invalid option \`-$OPTARG'"
+	fi
+	bad_exit "$msg" 2
+}
+
+get_long() {
+	# $1: output, $2 ...: args
+	local -n ref=$1
+	OPTIND=$(( $OPTIND+1 ))
+	ref="${!OPTIND}"
+}
+
+parse() {
+	# $1 ...: args
+	OPTSTR=":hv-:"
+	while getopts $OPTSTR OPT; do
+		case "$OPT" in
+			-)
+				case "${OPTARG}" in
+					help)		usage;		return 0 	;;
+					version)	version; 	return 0 	;;
+					*)			invalid_invocation true	;;
+				esac
+				;;
+			h)	usage;		return 0 	;;
+			v)	version; 	return 0 	;;
+			*)	invalid_invocation ;;
+		esac
+	done
+}
+
+#################
+# Entrypoint	#
+#################
+
+parse "$@"
+exit $?
