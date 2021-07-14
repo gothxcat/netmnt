@@ -37,7 +37,7 @@
 
 EXEC="$(basename "$0")"
 VERSION=1.0.0
-NBTSCAN=$(which nbtscan)
+NBTSCAN=$(command -v nbtscan)
 
 [ -z "${SUDO-}" ]		&& SUDO=sudo
 [ -n "${SUDO_USER-}" ]	&& USER=$SUDO_USER
